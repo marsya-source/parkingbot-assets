@@ -1,0 +1,1123 @@
+/*
+  ParkingBot - Integrated: Autonomous Navigation + ThingsBoard Telemetry
+  - Features: Line Following, Bump Logic, Smart Parking (Ultrasonic), Memory Recovery
+  - Features: Speed (m/s), Distance (m), Battery (%, V, Wh), Intersection Counting
+  - Replaces Bluetooth with WiFi + MQTT to ThingsBoard
+  - ThingsBoard RPC "setStart" controls START/STOP (true -> RUNNING, false -> IDLE)
+  - OPTIMIZED TELEMETRY:
+    * Speed + Distance: every 1 second
+    * Battery %: every 10 seconds
+    * Status + Intersections: on event (state change / intersection detected)
+
+        LATEST ADJUSTMENT: 
+    1. flush MQTT before and after bump...no state idle after riding the bump.
+    2. Overcome double-call getDistance() bump road
+    3. Fix Parking entry rotating by simple fix
+    4. Add stop commands when wifi drop in mid run
+    5. Added ,ap functions but still uncalibrated
+*/
+
+#include <Wire.h>
+#include <WiFi.h>
+#include <Arduino.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+// ==========================
+// ThingsBoard / WiFi config
+// ==========================
+const char* ssid = "marcymoo";      // <-- set your WiFi SSID
+const char* pass = "lemonboi";      // <-- set your WiFi password
+
+const char* TB_SERVER = "mqtt.thingsboard.cloud";
+const uint16_t TB_PORT = 1883;
+const char* TB_TOKEN  = "zEwt9hCSwBzayMRfT9bC"; // <-- set your ThingsBoard device token
+
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+String clientId;
+//HardwareSerial Serial2(2);
+
+// ==========================
+// 1. PINS CONFIGURATION
+// ==========================
+
+// --- UART PI ---
+#define RX_PI 3 
+#define TX_PI 1
+
+// --- SENSORS (NAVIGATION) ---
+const uint8_t PIN_IR_L   = 17; 
+const uint8_t PIN_IR_C   = 4; 
+const uint8_t PIN_IR_R   = 15; 
+const uint8_t PIN_TURN_L = 33; 
+const uint8_t PIN_TURN_R = 39; // PIN VN
+
+// --- ULTRASONIC ---
+const uint8_t PIN_TRIG = 23; 
+const uint8_t PIN_ECHO = 36; // PIN VP
+
+// --- ENCODERS (MONITORING) ---
+#define ENC_FL 19
+#define ENC_FR 16
+
+// --- BATTERY ADC (MONITORING) ---
+#define BAT_ADC1 32 
+#define BAT_ADC2 35 
+#define BAT_ADC3 34 
+
+// --- MOTORS ---
+const uint8_t FL_GREEN = 12; const uint8_t FL_RED = 2; 
+const uint8_t FR_GREEN = 14; const uint8_t FR_RED = 27; 
+const uint8_t RL_GREEN = 26; const uint8_t RL_RED = 25; 
+const uint8_t RR_GREEN = 18; const uint8_t RR_RED = 5; 
+
+// ==========================
+// 2. CONSTANTS & SETTINGS
+// ==========================
+
+// --- NAVIGATION SETTINGS ---
+const int SPEED_SLOW   = 130; 
+const int SPEED_NORMAL = 190;
+const int SPEED_HIGH   = 225; 
+
+int currentSpeed = SPEED_NORMAL;
+int turnSpeed    = 240;
+int correctSpeed = 200;
+
+// Parking & Bump
+const int STOP_DISTANCE_CM = 18; 
+const int BUMP_DETECT_CM   = 10; 
+
+// --- MONITORING CONSTANTS ---
+const float WHEEL_DIAMETER = 0.065; 
+const float GEAR_RATIO = 48.0;      
+const int PULSES_PER_MOTOR_REV = 20;
+const float PI_VAL = 3.14159265;
+
+// Derived
+const float PULSES_PER_WHEEL_REV = PULSES_PER_MOTOR_REV * GEAR_RATIO; 
+const float WHEEL_CIRCUMFERENCE = PI_VAL * WHEEL_DIAMETER; 
+
+unsigned long lastMillis = 0;
+
+// Battery Calibration
+float CURRENT_SENSITIVITY = 0.185;
+const float FINAL_RATIO_CH1 = 4.720; // Fixed 
+const float FINAL_RATIO_CH2 = 2.910; // Fixed
+const float FINAL_RATIO_CH3 = 2.537; // Fixed
+const float CELLS[3] = {4.0, 2.0, 2.0};
+float v_filter[3] = {0, 0, 0}; 
+
+// PWM Config
+const uint8_t CH_FL_G = 0; const uint8_t CH_FL_R = 1;
+const uint8_t CH_FR_G = 2; const uint8_t CH_FR_R = 3;
+const uint8_t CH_RL_G = 4; const uint8_t CH_RL_R = 5;
+const uint8_t CH_RR_G = 6; const uint8_t CH_RR_R = 7;
+const int PWM_FREQ = 20000;
+const int PWM_RES  = 8;
+
+// BOOLS & MEMORY
+bool has_notRide = true;
+bool has_notParked = true;
+int lastLineSide = 0; // Graded Scale: -3 to 3
+int intersectionCount = 0;
+
+// ==========================
+// 3. GLOBAL VARIABLES
+// ==========================
+
+// Add this enum alongside your existing State enum
+enum RotatePhase {
+  ROT_SPINNING,       // Phase 1: pure rightward rotation
+  ROT_ADJUST_LEFT,    // Phase 2a: TL hit first → nudge adjust
+  ROT_ADJUST_RIGHT,   // Phase 2b: TR hit first → nudge adjust
+  ROT_COMMIT          // Phase 3: both detected → 200ms commit
+};
+RotatePhase rotatePhase = ROT_SPINNING;
+unsigned long rotatePhaseTimer = 0;
+
+
+// States
+enum State { 
+  IDLE, 
+  RUNNING, 
+  CALIBRATION, 
+  SEARCH_PARKING,
+  PARK_ENTRY_ROTATE, 
+  PARK_MOVE_IN,      
+  PARK_WAIT,         
+  PARK_EXIT_REVERSE, 
+  PARK_EXIT_ROTATE   
+};
+State state = IDLE;
+
+// Human-readable status text published to ThingsBoard
+String statusText = "IDLE";
+
+// Encoder Counters (Volatile for ISR)
+volatile long globalCount_FL = 0;
+volatile long globalCount_FR = 0;
+
+// Speed Calculation Vars
+long prevCount_FL = 0;
+long prevCount_FR = 0;
+float currentSpeed_mps = 0.0; // Stored for Telemetry
+
+// Global variables to store accumulated Watt-hours
+float Wh1 = 0, Wh2 = 0, Wh3 = 0;
+
+// Timers
+unsigned long lastSpeedTime = 0;
+unsigned long parkStartTime = 0;
+unsigned long lastObstacleStop = 0; 
+
+// ==========================
+// TELEMETRY TIMERS
+// ==========================
+unsigned long lastTelemetry_SpeedDist = 0;
+unsigned long lastTelemetry_Battery = 0;
+unsigned long lastTelemetry_Event = 0;
+
+unsigned long telemetryInterval_SpeedDist = 1000;  // Every 1 second
+unsigned long telemetryInterval_Battery = 10000;   // Every 10 seconds
+
+// Event tracking
+State previousState = IDLE;
+int previousIntersectionCount = 0;
+
+// Forward declarations
+void publishSpeedDistTelemetry();
+void publishBatteryTelemetry();
+void publishEventTelemetry();
+
+// ==========================
+// 4. INTERRUPTS & HELPER FUNCTIONS
+// ==========================
+
+// ISR
+void IRAM_ATTR encoderFL() { globalCount_FL++; }
+void IRAM_ATTR encoderFR() { globalCount_FR++; }
+
+// --- NAVIGATION HELPERS ---
+bool isLine(uint8_t pin) {
+  return (digitalRead(pin) == LOW);
+}
+
+float getDistance() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+  long duration = pulseIn(PIN_ECHO, HIGH, 30000); 
+  if (duration == 0) return 999.0; 
+  return (duration * 0.034 / 2);
+}
+
+// --- MONITORING HELPERS ---
+float getAccuratePercentage(float v, int i) {
+    float vpc = v / CELLS[i]; 
+    float p = 0;
+    if (vpc >= 4.20) p = 100.0;
+    else if (vpc >= 4.00) p = 84.0 + (vpc - 4.00) * 80.0;  
+    else if (vpc >= 3.80) p = 50.0 + (vpc - 3.80) * 170.0; 
+    else if (vpc >= 3.70) p = 15.0 + (vpc - 3.70) * 350.0; 
+    else if (vpc >= 3.30) p = 0.0 + (vpc - 3.30) * 37.5;   
+    else p = 0.0;
+    return p;
+}
+
+float readStableVoltage(uint8_t pin, float ratio, int chIdx) {
+    long rawSum = 0;
+    for(int i=0; i<400; i++) rawSum += analogRead(pin);
+    float rawAvg = rawSum / 400.0;
+    float batteryV = (rawAvg / 4095.0) * 3.3 * ratio;
+
+    if (v_filter[chIdx] == 0) v_filter[chIdx] = batteryV;
+    v_filter[chIdx] = (v_filter[chIdx] * 0.95) + (batteryV * 0.05);
+    
+    return v_filter[chIdx];
+}
+
+float readCurrent(uint8_t pin) {
+  int rawADC = analogRead(pin);
+  float voltage = (rawADC / 4095.0) * 3.3; 
+  float current = (voltage - 1.65) / CURRENT_SENSITIVITY;
+  return (current < 0) ? 0 : current; 
+}
+
+// --- MOTOR CONTROL ---
+void stopMotor(uint8_t chGreen, uint8_t chRed) {
+  ledcWrite(chGreen, 0); ledcWrite(chRed, 0);
+}
+
+void driveNormal(uint8_t chGreen, uint8_t chRed, int speed, bool forward) {
+  if (forward) { ledcWrite(chGreen, speed); ledcWrite(chRed, 0); } 
+  else { ledcWrite(chGreen, 0); ledcWrite(chRed, speed); }
+}
+
+void driveSwapped(uint8_t chGreen, uint8_t chRed, int speed, bool forward) {
+  if (forward) { ledcWrite(chGreen, 0); ledcWrite(chRed, speed); } 
+  else { ledcWrite(chGreen, speed); ledcWrite(chRed, 0); }
+}
+
+void stopAllMotors() {
+  stopMotor(CH_FL_G, CH_FL_R); stopMotor(CH_FR_G, CH_FR_R);
+  stopMotor(CH_RL_G, CH_RL_R); stopMotor(CH_RR_G, CH_RR_R);
+}
+
+void driveLeftSide(int speed) {
+  bool fwd = speed >= 0;
+  int pwm = constrain(abs(speed), 0, 255);
+  driveSwapped(CH_FL_G, CH_FL_R, pwm, fwd);
+  driveNormal(CH_RL_G, CH_RL_R, pwm, fwd);
+}
+
+void driveRightSide(int speed) {
+  bool fwd = speed >= 0;
+  int pwm = constrain(abs(speed), 0, 255);
+  driveNormal(CH_FR_G, CH_FR_R, pwm, fwd);
+  driveSwapped(CH_RR_G, CH_RR_R, pwm, fwd);
+}
+
+void rotateLeft() { driveLeftSide(-turnSpeed); driveRightSide(turnSpeed); }
+void rotateRight() { driveLeftSide(turnSpeed); driveRightSide(-turnSpeed); }
+void moveReverse() { driveLeftSide(-170); driveRightSide(-170); }
+
+// --- NEW!!! MAP POSITION CALCULATOR ---
+
+// Define your circuit path segments (in meters) - ADJUST THESE TO YOUR ACTUAL CIRCUIT
+const float SEGMENT_BOTTOM = 2.4;
+const float SEGMENT_RIGHT = 2.4;
+const float SEGMENT_TOP = 5.4;
+const float SEGMENT_LEFT = 1.8;
+const float CIRCUIT_PERIMETER = SEGMENT_BOTTOM + SEGMENT_RIGHT + SEGMENT_TOP + SEGMENT_LEFT;
+
+// Circuit corners (adjust these to match your image)
+const float START_X = 0.15, START_Y = 0.85;      // Bottom-left (START)
+const float CORNER1_X = 0.85, CORNER1_Y = 0.85;  // Bottom-right
+const float CORNER2_X = 0.85, CORNER2_Y = 0.25;  // Top-right
+const float CORNER3_X = 0.15, CORNER3_Y = 0.25;  // Top-left
+
+// Parking spots coordinates (5 spots at top) - ADJUST TO YOUR IMAGE
+// Each parking spot position on the circuit image
+struct ParkingSpot {
+  float x;      // x position on image (0-1)
+  float y;      // y position on image (0-1)
+  int spotNum;  // Spot number (1-5)
+};
+
+const ParkingSpot PARKING_SPOTS[] = {
+  {0.25, 0.35},  // Spot 1 (left side)
+  {0.40, 0.35},  // Spot 2
+  {0.50, 0.35},  // Spot 3 (center)
+  {0.60, 0.35},  // Spot 4
+  {0.75, 0.35}   // Spot 5 (right side)
+};
+const int TOTAL_PARKING_SPOTS = 5;
+
+// Current parking spot the robot is in (0 = not parked, 1-5 = spot number)
+int currentParkingSpot = 0;
+
+// Calculate normalized position (0.0 to 1.0) based on distance traveled
+void calculateNormalizedPosition(float& normX, float& normY) {
+  // Get total distance traveled since startup
+  noInterrupts();
+  long currentFL = globalCount_FL;
+  long currentFR = globalCount_FR;
+  interrupts();
+  
+  float distFL = ((float)currentFL / PULSES_PER_WHEEL_REV) * WHEEL_CIRCUMFERENCE;
+  float distFR = ((float)currentFR / PULSES_PER_WHEEL_REV) * WHEEL_CIRCUMFERENCE;
+  float totalDist = (distFL + distFR) / 2.0;
+  
+  // Position on circuit (repeats after completing full circuit)
+  float posOnCircuit = fmod(totalDist, CIRCUIT_PERIMETER);
+  
+  // Determine which segment robot is on and calculate position
+  // Bottom segment (0 to 8m): Move from START to CORNER1
+  if (posOnCircuit < SEGMENT_BOTTOM) {
+    float t = posOnCircuit / SEGMENT_BOTTOM;
+    normX = START_X + (CORNER1_X - START_X) * t;
+    normY = START_Y;
+  }
+  // Right segment (8 to 12.5m): Move from CORNER1 to CORNER2
+  else if (posOnCircuit < SEGMENT_BOTTOM + SEGMENT_RIGHT) {
+    float t = (posOnCircuit - SEGMENT_BOTTOM) / SEGMENT_RIGHT;
+    normX = CORNER1_X;
+    normY = CORNER1_Y + (CORNER2_Y - CORNER1_Y) * t;
+  }
+  // Top segment (12.5 to 20.5m): Move from CORNER2 to CORNER3
+  else if (posOnCircuit < SEGMENT_BOTTOM + SEGMENT_RIGHT + SEGMENT_TOP) {
+    float t = (posOnCircuit - SEGMENT_BOTTOM - SEGMENT_RIGHT) / SEGMENT_TOP;
+    normX = CORNER2_X + (CORNER3_X - CORNER2_X) * t;
+    normY = CORNER2_Y;
+  }
+  // Left segment (20.5 to 25m): Move from CORNER3 back to START
+  else {
+    float t = (posOnCircuit - SEGMENT_BOTTOM - SEGMENT_RIGHT - SEGMENT_TOP) / SEGMENT_LEFT;
+    normX = CORNER3_X;
+    normY = CORNER3_Y + (START_Y - CORNER3_Y) * t;
+  }
+  
+  normX = constrain(normX, 0.0, 1.0);
+  normY = constrain(normY, 0.0, 1.0);
+}
+
+// Detect which parking spot the robot is in
+void detectParkingSpot(float normX, float normY) {
+  // Distance threshold for detecting if robot is "in" a spot (in normalized coordinates)
+  const float PARKING_DETECTION_RADIUS = 0.08;  // Adjust sensitivity (0-1 scale)
+  
+  int closestSpot = 0;
+  float closestDistance = 999.0;
+  
+  // Check distance to each parking spot
+  for (int i = 0; i < TOTAL_PARKING_SPOTS; i++) {
+    float dx = normX - PARKING_SPOTS[i].x;
+    float dy = normY - PARKING_SPOTS[i].y;
+    float distance = sqrt(dx * dx + dy * dy);
+    
+    // If within detection radius
+    if (distance < PARKING_DETECTION_RADIUS && distance < closestDistance) {
+      closestDistance = distance;
+      closestSpot = PARKING_SPOTS[i].spotNum;
+    }
+  }
+  
+  // Update current parking spot if changed
+  if (closestSpot != currentParkingSpot) {
+    currentParkingSpot = closestSpot;
+    if (currentParkingSpot > 0) {
+      Serial.printf("🅿️  Robot near parking spot #%d\n", currentParkingSpot);
+    } else {
+      Serial.println("🚗 Robot on circuit (not in parking area)");
+    }
+  }
+}
+
+// Publish position data to ThingsBoard for map widget
+void publishMapTelemetry() {
+  if (!mqtt.connected()) return;
+  
+  // Calculate normalized position
+  float normX, normY;
+  calculateNormalizedPosition(normX, normY);
+  
+  // Detect if robot is in a parking spot
+  detectParkingSpot(normX, normY);
+  
+  // Get distance traveled
+  noInterrupts();
+  long currentFL = globalCount_FL;
+  long currentFR = globalCount_FR;
+  interrupts();
+  float distFL = ((float)currentFL / PULSES_PER_WHEEL_REV) * WHEEL_CIRCUMFERENCE;
+  float distFR = ((float)currentFR / PULSES_PER_WHEEL_REV) * WHEEL_CIRCUMFERENCE;
+  float totalDist = (distFL + distFR) / 2.0;
+  
+  // Create JSON payload
+  StaticJsonDocument<256> doc;
+  doc["x"] = normX;                    // Position on circuit (0-1)
+  doc["y"] = normY;                    // Position on circuit (0-1)
+  doc["distance"] = totalDist;         // Total meters traveled
+  doc["parkingSpot"] = currentParkingSpot;  // Which spot (0 = none, 1-5)
+  doc["intersections"] = intersectionCount;
+  doc["statusText"] = stateToString(state);
+  
+  // Serialize and publish
+  char buf[256];
+  size_t n = serializeJson(doc, buf);
+  mqtt.publish("v1/devices/me/telemetry", buf, n);
+  
+  Serial.printf("[MAP] x=%.3f, y=%.3f, dist=%.2fm, parking=%d, status=%s\n", 
+                normX, normY, totalDist, currentParkingSpot, stateToString(state).c_str());
+}
+
+// --- RUN FOLLOWING FUNCTION ---
+void runLineFollowLogic() {
+    bool L = isLine(PIN_IR_L);
+    bool C = isLine(PIN_IR_C);
+    bool R = isLine(PIN_IR_R);
+    bool TL = isLine(PIN_TURN_L);
+    bool TR = isLine(PIN_TURN_R);
+
+    // --- INTERSECTION LOGIC ---
+    if (TL && L && !C && R && !TR) { // LEFT CORNER
+      intersectionCount++;
+      Serial.printf("Intersection #%d Detected (Left)\n", intersectionCount);
+      driveLeftSide(-currentSpeed); driveRightSide(-currentSpeed); delay(50);
+      rotateLeft(); delay(300);
+      while(!isLine(PIN_IR_C) || isLine(PIN_TURN_R) || !isLine(PIN_IR_L) || !isLine(PIN_IR_R)) rotateLeft();
+      driveLeftSide(-110); driveRightSide(255); delay(150);
+      lastLineSide = 0; // RESET MEMORY POST-INTERSECTION
+      return;
+    }
+    if (TL && L && !C && !R && !TR) { // LEFT CORNER DRIFT
+      intersectionCount++;
+      Serial.printf("Intersection #%d Detected (Left Drift)\n", intersectionCount);
+      driveLeftSide(-currentSpeed); driveRightSide(-currentSpeed); delay(50);
+      rotateLeft(); delay(300);
+      while(!isLine(PIN_IR_C) || isLine(PIN_TURN_R)) { driveLeftSide(-currentSpeed); driveRightSide(250); }
+      driveLeftSide(-110); driveRightSide(255); delay(150);
+      lastLineSide = 0; // RESET MEMORY POST-INTERSECTION
+      return;
+    }
+    if (!TL && L && !C && R && TR) { // RIGHT CORNER
+      intersectionCount++;
+      Serial.printf("Intersection #%d Detected (Right)\n", intersectionCount);
+      driveLeftSide(-currentSpeed); driveRightSide(-currentSpeed); delay(50);
+      rotateRight(); delay(300);
+      while(!isLine(PIN_IR_C) || isLine(PIN_TURN_L) || !isLine(PIN_IR_L) || !isLine(PIN_IR_R)) rotateRight();
+      driveLeftSide(255); driveRightSide(-110); delay(150);
+      lastLineSide = 0; // RESET MEMORY POST-INTERSECTION
+      return;
+    }
+    if (!TL && !L && !C && R && TR) { // RIGHT CORNER DRIFT
+      intersectionCount++;
+      Serial.printf("Intersection #%d Detected (Right Drift)\n", intersectionCount);
+      driveLeftSide(-currentSpeed); driveRightSide(-currentSpeed); delay(50);
+      rotateRight(); delay(300);
+      while(!isLine(PIN_IR_C) || isLine(PIN_TURN_L) || !isLine(PIN_TURN_R)) rotateRight();
+      driveLeftSide(255); driveRightSide(-110); delay(150);
+      lastLineSide = 0; // RESET MEMORY POST-INTERSECTION
+      return;
+    }
+
+    // --- TRUE LAST LINE MEMORY (Graded Scale) ---
+    // 0 = Centered | Negative = Drift Right | Positive = Drift Left
+    if      ( TL && !R && !TR)                lastLineSide = -3;
+    else if (!TL && !TR &&  L && !C && !R)    lastLineSide = -2;
+    else if (!TL && !TR &&  L &&  C && !R)    lastLineSide = -1;
+    else if (!TL && !TR &&  C && (L == R))    lastLineSide =  0; // Simplifies 10001 and 11011
+    else if (!TL && !TR && !L &&  C &&  R)    lastLineSide =  1;
+    else if (!TL && !TR && !L && !C &&  R)    lastLineSide =  2;
+    else if (!L  && !C &&  TR)                lastLineSide =  3;
+
+    // --- LINE FOLLOWING LOGIC ---
+    if ((!TL && L && C && R && !TR) || (!TL && L && !C && R && !TR) || (!TL && L && C && R && TR) || (TL && L && C && R && !TR)) { // [ 10001 ] / [ 10101 ] / [ 10000 ] / [ 00001 ]
+       driveLeftSide(currentSpeed); driveRightSide(currentSpeed); 
+    }
+    else if (!TL && !L && C && !R && !TR) { // only C detected 
+      while(!isLine(PIN_IR_L) || !isLine(PIN_IR_R)){
+        driveLeftSide(currentSpeed); driveRightSide(currentSpeed);
+       }
+       return;
+    }
+    else if (!TL && !L && C && R && !TR) { // swift drifted RIGHT
+        unsigned long fixTime = millis();
+        while(!isLine(PIN_IR_L) && (millis() - fixTime < 200)) {
+            driveLeftSide(correctSpeed - 50); driveRightSide(correctSpeed+50); 
+            if (isLine(PIN_TURN_L) || isLine(PIN_TURN_R) || isLine(PIN_IR_L)) return; 
+        }
+      return;
+    }
+    else if (!TL && L && C && !R && !TR) { // swift drifted LEFT
+        unsigned long fixTime = millis();
+        while(!isLine(PIN_IR_R) && (millis() - fixTime < 200)) {
+            driveLeftSide(correctSpeed + 30); driveRightSide(correctSpeed-30); 
+            if (isLine(PIN_TURN_R) || isLine(PIN_TURN_R) || isLine(PIN_IR_L)) return; // Note: intentional fallback
+        }
+      return;
+    }
+    else if (!TL && L && !C && !R && !TR) { // drifted right
+        unsigned long fixTime = millis();
+        while(!isLine(PIN_IR_C) && (millis() - fixTime < 300)) {
+            driveLeftSide(120); driveRightSide(250);
+            if (isLine(PIN_TURN_L) || isLine(PIN_TURN_R) || isLine(PIN_IR_R)) { stopAllMotors(); return; } 
+        }
+        fixTime = millis();
+        while(!isLine(PIN_IR_C) && (millis() - fixTime < 200)) {
+            driveLeftSide(correctSpeed+20); driveRightSide(correctSpeed); 
+            if (isLine(PIN_TURN_L) || isLine(PIN_TURN_R) || isLine(PIN_IR_L)) { stopAllMotors(); return; }
+        }
+      return;
+    }
+    else if (!TL && !L && !C && R && !TR) { // drifted left 
+        unsigned long fixTime = millis();
+        while(!isLine(PIN_IR_C) && (millis() - fixTime < 300)) {
+            driveLeftSide(255); driveRightSide(120); 
+            if (isLine(PIN_TURN_L) || isLine(PIN_TURN_R) || isLine(PIN_IR_L)) { stopAllMotors(); return; } 
+        }
+        fixTime = millis();
+        while(!isLine(PIN_IR_C) && (millis() - fixTime < 200)) {
+            driveLeftSide(correctSpeed); driveRightSide(correctSpeed+20); 
+            if (isLine(PIN_TURN_L) || isLine(PIN_TURN_R) || isLine(PIN_IR_L)) { stopAllMotors(); return; }
+        }
+      return;
+    }  
+    else if (!TL && !L && !C && !R && !TR) { // No line detected [ 11111 ]
+        Serial.println("LINE LOST - Executing Smart Recovery...");
+        unsigned long searchStart = millis();
+        
+        while (!isLine(PIN_IR_C) && !isLine(PIN_IR_L) && !isLine(PIN_IR_R)) { 
+            // Safety timeout check first
+            if (millis() - searchStart > 3000) { 
+                stopAllMotors(); 
+                Serial.println("RECOVERY FAILED - MAP LOST"); 
+                break; }
+            switch (lastLineSide) {
+                // --- 1. MINOR DRIFT / GAP SLIP (Wide Arc) ---
+                case -1: case -2: driveLeftSide(120); driveRightSide(250); break;
+                case 1: case 2:  driveLeftSide(255); driveRightSide(110); break;
+                // --- 2. EXTREME DRIFT / SHARP CORNER MISS (Tank Pivot) ---
+                case -3: driveLeftSide(-150); driveRightSide(150); break;
+                case 3:  driveLeftSide(150); driveRightSide(-150); break;
+                // --- 3. CENTER LOSS / OVERSHOOT (Reverse) ---
+                case 0:
+                default: driveLeftSide(-150); driveRightSide(-150); break;
+            }
+        }
+        return;
+    }
+    else if ((TL && !L && !C && !R && !TR) || (!TL && !L && !C && !R && TR)) { // SIDE LINE LOST
+        stopAllMotors(); delay(300);
+        Serial.println("SIDE LINE LOST - Recovering...");
+        unsigned long recorrStart = millis();
+        if(TL){
+          while(millis() - recorrStart < 1200) { 
+              driveLeftSide(-255); driveRightSide(-120);
+              if (isLine(PIN_IR_L) || isLine(PIN_IR_C) || isLine(PIN_IR_R)) return;
+          }
+        }
+        else if(TR){
+            while (millis() - recorrStart < 1200) { 
+              driveLeftSide(-120); driveRightSide(-255);
+              if (isLine(PIN_IR_L) || isLine(PIN_IR_C) || isLine(PIN_IR_R)) return;
+            }
+        }
+    }
+    else { stopAllMotors(); }
+}
+
+void handlePiCommand(String s) {
+  s.trim(); s.toUpperCase();
+  // State Lockout: Ignore Pi commands if already parking
+  if (state == PARK_ENTRY_ROTATE || state == PARK_MOVE_IN || state == PARK_WAIT || state == PARK_EXIT_REVERSE || state == PARK_EXIT_ROTATE) {
+      return; 
+  }
+  if (s == "P_AREA") {
+    state = SEARCH_PARKING;
+    currentSpeed = SPEED_NORMAL;
+    Serial.println("Vision: Parking Area Detected. Searching...");
+  }
+  else if (s == "OKU" || s == "CONE") {
+    // COOLDOWN CHECK: Only stop if 800 miliseconds have passed since the last stop
+    if (millis() - lastObstacleStop > 800) {
+        stopAllMotors(); 
+        Serial.println("Vision: CONE/OKU. Stopping for 1 second...");
+        delay(1000); 
+        // Record the time we finished stopping
+        lastObstacleStop = millis();
+        // BUFFER FLUSH: The Pi was probably yelling "CONE" while we were asleep.
+        while (Serial2.available()) {
+            Serial2.read();
+        }
+        Serial.println("Resuming Line Follow... (Ignoring signs for 800 ms)");
+    }
+  }
+  else if (s == "EMPTY" && has_notParked) { 
+    state = PARK_ENTRY_ROTATE;
+    //stopAllMotors(); delay(1000);
+    Serial.println("Vision: Empty Slot! Parking...");
+  }
+}
+
+//=================================
+// --- ThingsBoard RPC Handling ---
+//=================================
+void handleRpc(const char* topic, byte* payload, unsigned int length)
+{
+  String t = String(topic);
+  int lastSlash = t.lastIndexOf('/');
+  String requestId = t.substring(lastSlash + 1);
+
+  String s;
+  for (unsigned int i = 0; i < length; i++) s += (char)payload[i];
+
+  Serial.print("RPC topic: ");
+  Serial.print(topic);
+  Serial.print(" payload: ");
+  Serial.println(s);
+
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, s);
+  String respPayload = "{\"success\":true}";
+  if (err) {
+    Serial.print("Failed to parse RPC JSON: ");
+    Serial.println(err.c_str());
+    String respTopic = "v1/devices/me/rpc/response/" + requestId;
+    mqtt.publish(respTopic.c_str(), "{\"error\":\"invalid json\"}");
+    return;
+  }
+
+  const char* method = nullptr;
+  if (doc.containsKey("method")) method = doc["method"];
+  JsonVariant params = doc["params"];
+
+  bool responded = false;
+
+  if (method) {
+    String m(method);
+    if (m == "setStart") {
+      bool value = false;
+      if (params.is<bool>()) value = params.as<bool>();
+      else if (params.is<int>()) value = (params.as<int>() != 0);
+      else if (params.is<const char*>()) {
+        String p = String((const char*)params.as<const char*>());
+        value = (p == "1" || p.equalsIgnoreCase("true"));
+      }
+      if (value) {
+        state = RUNNING;
+        Serial.println("RPC -> STARTED");
+      } else {
+        state = IDLE;
+        stopAllMotors();
+        Serial.println("RPC -> PAUSED");
+      }
+      publishEventTelemetry();  // Send status immediately on state change
+      responded = true;
+    }
+    else if (m == "exitParking") {
+    if (state == PARK_WAIT) {
+        state = PARK_EXIT_REVERSE;
+        Serial.println("RPC -> EXIT PARKING");
+        responded = true;
+      } else {
+        respPayload = "{\"success\":false,\"error\":\"not parked\"}";
+        responded = true;
+      }
+    }
+    else if (m == "restart") {
+      state = IDLE;
+      rotatePhase = ROT_SPINNING;
+      stopAllMotors();
+      noInterrupts();
+      globalCount_FL = 0;
+      globalCount_FR = 0;
+      prevCount_FL = 0;
+      prevCount_FR = 0;
+      interrupts();
+      
+      // Reset variables from final logic
+      Wh1 = Wh2 = Wh3 = 0;
+      intersectionCount = 0; 
+      previousIntersectionCount = 0;
+      has_notRide = true;
+      has_notParked = true;
+      statusText = "IDLE";
+      
+      Serial.println("RPC -> SYSTEM RESTARTED");
+      publishEventTelemetry();  // Send immediate update
+      responded = true;
+    }
+    else if (m == "setUpdateRate") {
+      if (params.is<int>()) {
+        unsigned long newRate = params.as<int>();
+        if (newRate >= 100) {
+          telemetryInterval_SpeedDist = newRate;
+          Serial.print("RPC -> telemetryInterval_SpeedDist set to ");
+          Serial.println(telemetryInterval_SpeedDist);
+          responded = true;
+        } else {
+          respPayload = "{\"success\":false,\"error\":\"min rate 100ms\"}";
+          responded = true;
+        }
+      }
+    }
+  }
+
+  String respTopic = "v1/devices/me/rpc/response/" + requestId;
+  mqtt.publish(respTopic.c_str(), respPayload.c_str());
+  if (!responded) {
+    Serial.println("RPC method not recognized");
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  handleRpc(topic, payload, length);
+}
+
+// ==========================
+// CONNECTIVITY
+// ==========================
+void connectToWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  stopAllMotors(); // ← safe stop before blocking
+  state = IDLE;    // ← don't resume mid-maneuver blindly
+  Serial.print("Connecting to WiFi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
+    if (millis() - start > 20000) {
+      WiFi.disconnect();
+      WiFi.begin(ssid, pass);
+      start = millis();
+    }
+  }
+  Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
+}
+
+void connectToThingsBoard() {
+  while (!mqtt.connected()) {
+    Serial.print("Connecting to ThingsBoard MQTT...");
+    uint32_t chipId = (uint32_t) ESP.getEfuseMac();
+    clientId = "ESP32-" + String((unsigned long)chipId, HEX);
+    if (mqtt.connect(clientId.c_str(), TB_TOKEN, NULL)) {
+      Serial.println("connected");
+      mqtt.subscribe("v1/devices/me/rpc/request/+");
+      publishEventTelemetry();  // Send initial status
+      publishSpeedDistTelemetry();  // Send initial speed/dist
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqtt.state());
+      Serial.println(" try again in 2 seconds");
+      delay(2000);
+    }
+  }
+}
+
+// Helper: map state enum to string (for ThingsBoard)
+String stateToString(State st) {
+  switch (st) {
+    case IDLE: return "IDLE";
+    case RUNNING: return "RUNNING";
+    case CALIBRATION: return "CALIBRATION";
+    case SEARCH_PARKING: return "SEARCH_PARKING";
+    case PARK_ENTRY_ROTATE: return "PARK_ENTRY_ROTATE";
+    case PARK_MOVE_IN: return "PARK_MOVE_IN";
+    case PARK_WAIT: return "PARK_WAIT";
+    case PARK_EXIT_REVERSE: return "PARK_EXIT_REVERSE";
+    case PARK_EXIT_ROTATE: return "PARK_EXIT_ROTATE";
+    default: return "UNKNOWN";
+  }
+}
+
+// ==========================
+// OPTIMIZED TELEMETRY PUBLISHING
+// ==========================
+
+void publishSpeedDistTelemetry() {
+  if (!mqtt.connected()) return;
+
+  // Calculate distance
+  noInterrupts();
+  long currentFL = globalCount_FL;
+  long currentFR = globalCount_FR;
+  interrupts();
+  float distFL = ((float)currentFL / PULSES_PER_WHEEL_REV) * WHEEL_CIRCUMFERENCE;
+  float distFR = ((float)currentFR / PULSES_PER_WHEEL_REV) * WHEEL_CIRCUMFERENCE;
+  float totalDist = (distFL + distFR) / 2.0;
+
+  StaticJsonDocument<256> doc;
+  doc["distance"] = totalDist * 5;
+  doc["speed"] = currentSpeed_mps * 10;
+
+  char buf[256];
+  size_t n = serializeJson(doc, buf);
+  mqtt.publish("v1/devices/me/telemetry", buf, n);
+
+  Serial.println("[TELEMETRY - SPEED/DIST] Published");
+  Serial.printf("  Distance: %.2f m, Speed: %.2f m/s\n", totalDist * 5, currentSpeed_mps * 10);
+}
+
+void publishBatteryTelemetry() {
+  if (!mqtt.connected()) return;
+
+  float v1 = readStableVoltage(BAT_ADC1, FINAL_RATIO_CH1, 0);
+  float v2 = readStableVoltage(BAT_ADC2, FINAL_RATIO_CH2, 1);
+  float v3 = readStableVoltage(BAT_ADC3, FINAL_RATIO_CH3, 2);
+
+  float p1 = getAccuratePercentage(v1, 0);
+  float p2 = getAccuratePercentage(v2, 1);
+  float p3 = getAccuratePercentage(v3, 2);
+
+  StaticJsonDocument<256> doc;
+  doc["bat1_pct"] = p1;
+  doc["bat2_pct"] = p2;
+  doc["bat3_pct"] = p3;
+
+  char buf[256];
+  size_t n = serializeJson(doc, buf);
+  mqtt.publish("v1/devices/me/telemetry", buf, n);
+
+  Serial.println("[TELEMETRY - BATTERY] Published");
+  Serial.printf("  Motor: %.0f%% | MCU: %.0f%% | Sensor: %.0f%%\n", p1, p2, p3);
+  if (v1 < (CELLS[0] * 3.3)) Serial.println("  ! LOW MOTOR BATTERY !");
+}
+
+void publishEventTelemetry() {
+  if (!mqtt.connected()) return;
+
+  StaticJsonDocument<256> doc;
+  doc["statusText"] = stateToString(state);
+  doc["intersections"] = intersectionCount;
+
+  char buf[256];
+  size_t n = serializeJson(doc, buf);
+  mqtt.publish("v1/devices/me/telemetry", buf, n);
+
+  Serial.println("[TELEMETRY - EVENT] Published");
+  Serial.printf("  Status: %s | Intersections: %d\n", stateToString(state).c_str(), intersectionCount);
+}
+
+// ==========================
+// 6. SETUP
+// ==========================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ParkingBot - Starting...");
+  Serial2.begin(9600, SERIAL_8N1, RX_PI, TX_PI);
+  analogReadResolution(12);
+
+  pinMode(PIN_IR_L, INPUT); pinMode(PIN_IR_C, INPUT);
+  pinMode(PIN_IR_R, INPUT); pinMode(PIN_TURN_L, INPUT);
+  pinMode(PIN_TURN_R, INPUT);
+  pinMode(PIN_TRIG, OUTPUT); pinMode(PIN_ECHO, INPUT);
+
+  pinMode(ENC_FL, INPUT_PULLUP);
+  pinMode(ENC_FR, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_FL), encoderFL, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_FR), encoderFR, RISING);
+
+  ledcSetup(CH_FL_G, PWM_FREQ, PWM_RES); ledcSetup(CH_FL_R, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_FR_G, PWM_FREQ, PWM_RES); ledcSetup(CH_FR_R, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_RL_G, PWM_FREQ, PWM_RES); ledcSetup(CH_RL_R, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_RR_G, PWM_FREQ, PWM_RES); ledcSetup(CH_RR_R, PWM_FREQ, PWM_RES);
+
+  ledcAttachPin(FL_GREEN, CH_FL_G); ledcAttachPin(FL_RED,   CH_FL_R);
+  ledcAttachPin(FR_GREEN, CH_FR_G); ledcAttachPin(FR_RED,   CH_FR_R);
+  ledcAttachPin(RL_GREEN, CH_RL_G); ledcAttachPin(RL_RED,   CH_RL_R);
+  ledcAttachPin(RR_GREEN, CH_RR_G); ledcAttachPin(RR_RED,   CH_RR_R);
+
+  stopAllMotors();
+
+  // WiFi + MQTT Setup
+  mqtt.setClient(espClient);
+  mqtt.setServer(TB_SERVER, TB_PORT);
+  mqtt.setCallback(mqttCallback);
+
+  connectToWiFi();
+  connectToThingsBoard();
+
+  lastMillis = millis();
+  lastSpeedTime = millis();
+  lastTelemetry_SpeedDist = millis();
+  lastTelemetry_Battery = millis();
+
+  previousState = IDLE;
+  previousIntersectionCount = 0;
+
+  Serial.println("System Ready. Waiting for Command...");
+}
+
+// ==========================
+// 7. MAIN LOOP
+// ==========================
+void loop() {
+  // Check connection with PI
+  if (Serial2.available()) {
+    handlePiCommand(Serial2.readStringUntil('\n'));
+  }
+
+  // Maintain MQTT connection
+  if (WiFi.status() != WL_CONNECTED) {
+    connectToWiFi();
+  }
+  if (!mqtt.connected()) {
+    connectToThingsBoard();
+  }
+  mqtt.loop();
+
+  unsigned long now = millis();
+  statusText = stateToString(state);
+
+  // -----------------------------------------------------------
+  // SPEED CALCULATION (Every 500ms)
+  // -----------------------------------------------------------
+  if (now - lastSpeedTime >= 500) {
+      float dt = (now - lastSpeedTime) / 1000.0;
+      lastSpeedTime = now;
+
+      noInterrupts();
+      long currentFL = globalCount_FL;
+      long currentFR = globalCount_FR;
+      interrupts();
+
+      long deltaFL = currentFL - prevCount_FL;
+      long deltaFR = currentFR - prevCount_FR;
+      prevCount_FL = currentFL;
+      prevCount_FR = currentFR;
+
+      float speed_FL = ((float)deltaFL / PULSES_PER_WHEEL_REV) * WHEEL_CIRCUMFERENCE / dt;
+      float speed_FR = ((float)deltaFR / PULSES_PER_WHEEL_REV) * WHEEL_CIRCUMFERENCE / dt;
+      
+      // Store to global for TB JSON
+      currentSpeed_mps = (speed_FL + speed_FR) / 2.0;
+
+      Serial.printf("[SPEED] FR: %.2f m/s | FL: %.2f m/s | Avg: %.2f m/s\n", speed_FR*10, speed_FL*10, currentSpeed_mps*10);
+  }
+
+  // -----------------------------------------------------------
+  // TELEMETRY - MAP POSITION (Every 200ms)
+  // -----------------------------------------------------------
+  static unsigned long lastMapUpdate = 0;
+  if (now - lastMapUpdate >= 200) {
+    lastMapUpdate = now;
+    publishMapTelemetry();
+  }
+
+  // -----------------------------------------------------------
+  // TELEMETRY - SPEED & DISTANCE (Every 1 second)
+  // -----------------------------------------------------------
+  if (now - lastTelemetry_SpeedDist >= telemetryInterval_SpeedDist) {
+      lastTelemetry_SpeedDist = now;
+      publishSpeedDistTelemetry();
+  }
+
+  // -----------------------------------------------------------
+  // TELEMETRY - BATTERY % (Every 10 seconds)
+  // -----------------------------------------------------------
+  if (now - lastTelemetry_Battery >= telemetryInterval_Battery) {
+      lastTelemetry_Battery = now;
+      
+      // Also calculate accumulated Wh in the background before publishing
+      float deltaHours = (now - lastMillis) / 3600000.0; 
+      lastMillis = now;
+      float v1 = readStableVoltage(BAT_ADC1, FINAL_RATIO_CH1, 0);
+      float v2 = readStableVoltage(BAT_ADC2, FINAL_RATIO_CH2, 1);
+      float v3 = readStableVoltage(BAT_ADC3, FINAL_RATIO_CH3, 2);
+      float i1 = readCurrent(BAT_ADC1); 
+      float i2 = readCurrent(BAT_ADC2);
+      float i3 = readCurrent(BAT_ADC3);
+      Wh1 += (v1 * i1) * deltaHours;
+      Wh2 += (v2 * i2) * deltaHours;
+      Wh3 += (v3 * i3) * deltaHours;
+
+      publishBatteryTelemetry();
+  }
+
+  // -----------------------------------------------------------
+  // TELEMETRY - EVENT (State change or Intersection detected)
+  // -----------------------------------------------------------
+  if (state != previousState || intersectionCount != previousIntersectionCount) {
+      previousState = state;
+      previousIntersectionCount = intersectionCount;
+      publishEventTelemetry();
+  }
+
+  // -----------------------------------------------------------
+  // NAVIGATION TASK: ROBOT CONTROL LOGIC
+  // -----------------------------------------------------------
+  switch (state) {
+    case RUNNING:
+      currentSpeed = SPEED_NORMAL;
+      {
+        float dist = getDistance(); // ← cache once, no double-fire
+        if (dist > 0 && dist < BUMP_DETECT_CM && has_notRide) {
+          stopAllMotors();
+          Serial.println("Bump Detected! Stopping...");
+
+          // ── FLUSH: drain any queued MQTT messages before going dark ──
+          mqtt.loop(); mqtt.loop(); mqtt.loop();
+
+          delay(1000);
+          Serial.println("Boosting over bump...");
+          driveLeftSide(SPEED_HIGH); driveRightSide(SPEED_HIGH); delay(1500);
+          driveLeftSide(SPEED_SLOW); driveRightSide(SPEED_SLOW); delay(1300);
+          lastLineSide = 2;
+          has_notRide = false;
+
+          // ── FLUSH: drain anything that arrived while we were busy ──
+                //while (mqtt.connected() && mqtt.loop()) {}    UNCOMMENT THIS IF CODE BELOW DOESNOT WORK
+          // Explicitly re-assert RUNNING state after bump in case RPC fired
+          // Drain for at most 100ms
+          unsigned long flushStart = millis();
+          while (millis() - flushStart < 100) mqtt.loop();
+          state = RUNNING;
+          Serial.println("Resuming Line Follow...");
+        }
+      }
+      runLineFollowLogic();
+    break;
+
+    case SEARCH_PARKING:
+      //currentSpeed = SPEED_NORMAL;
+      runLineFollowLogic();
+      break;
+
+    case PARK_ENTRY_ROTATE:
+    //stopAllMotors(); delay(50);
+    rotateRight();
+    if (isLine(PIN_TURN_L) && isLine(PIN_TURN_R)) {
+      driveLeftSide(130); driveRightSide(-130);
+      delay(200); stopAllMotors(); delay(500);
+// 1. RECORD THE START TIME HERE
+      parkStartTime = millis();
+      state = PARK_MOVE_IN;
+      Serial.println("PARK: Aligned. Moving In...");
+      //has_notParked = false;
+    } else if(!isLine(PIN_TURN_L) && isLine(PIN_TURN_R)){
+      driveLeftSide(130); driveRightSide(-130);
+      delay(400); stopAllMotors(); delay(500);
+    } else if(isLine(PIN_TURN_L) && !isLine(PIN_TURN_R)){
+      driveLeftSide(130); driveRightSide(-130);
+      delay(400); stopAllMotors(); delay(500);
+    }
+    break;
+
+    case PARK_MOVE_IN:
+      // Check if 2.8 seconds (2800ms) have passed since we started moving in
+      //parkStartTime = 0;
+      if (millis() - parkStartTime >= 2500) {
+        stopAllMotors();
+        Serial.println("Wh MONITOR");
+        Serial.printf("CH1 Energy: %.3f Wh \n", Wh1);
+        Serial.printf("CH2 Energy: %.3f Wh \n", Wh2);
+        Serial.printf("CH3 Energy: %.3f Wh \n", Wh3);
+        state = PARK_WAIT;
+        Serial.println("PARK: Stopped. Waiting for EXIT...");
+      } else {
+        // If 2.8 seconds haven't passed yet, keep driving forward
+        driveLeftSide(180); driveRightSide(180);
+      }
+      break;
+
+    case PARK_WAIT:
+      stopAllMotors();
+      break;
+
+    case PARK_EXIT_REVERSE:
+      moveReverse();
+      if (isLine(PIN_TURN_L) && isLine(PIN_TURN_R)) {
+        stopAllMotors(); delay(500);
+        state = PARK_EXIT_ROTATE;
+        Serial.println("PARK: Reversing Done. Rotating Left...");
+      }
+      break;
+
+    case PARK_EXIT_ROTATE:
+      rotateLeft(); delay(200); 
+      if (isLine(PIN_IR_C) && isLine(PIN_IR_L) && isLine(PIN_IR_R) && !isLine(PIN_TURN_L) && !isLine(PIN_TURN_R)) {
+        rotateLeft(); delay(200); stopAllMotors(); delay(500);
+        state = RUNNING;
+        Serial.println("PARK: Exited. Resume Running.");
+      }
+      break;
+
+    case CALIBRATION:
+      Serial.printf("IR:[%d %d %d %d %d] Dist US:%.1f\n", 
+          digitalRead(PIN_TURN_L), digitalRead(PIN_IR_L), digitalRead(PIN_IR_C), 
+          digitalRead(PIN_IR_R), digitalRead(PIN_TURN_R), getDistance());
+      delay(500);
+      break;
+
+    case IDLE:
+    default:
+      stopAllMotors();
+      break;
+  }
+}
